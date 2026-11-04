@@ -224,7 +224,41 @@ def extract_tar(archive: Path | IO[bytes], dest: Path) -> None:
     real_dest = os.path.realpath(dest)
     opened = tarfile.open(archive) if isinstance(archive, (str, os.PathLike)) else tarfile.open(fileobj=archive)
     with opened as tf:
-        tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        try:
+            tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        except TypeError:
+            # Fallback for Python <3.12: extractall() does not accept a `filter` argument.
+            # Manually extract members with the same containment checks.
+            dest.mkdir(parents=True, exist_ok=True)
+            for member in tf.getmembers():
+                if member.issym():
+                    if os.path.isabs(member.linkname):
+                        raise tarfile.AbsoluteLinkError(member)
+                    name = member.name.rstrip("/")
+                    placed = os.path.realpath(os.path.join(real_dest, name))
+                    link_dir = os.path.dirname(name)
+                    target = os.path.realpath(os.path.join(real_dest, link_dir, member.linkname))
+                    for path in (placed, target):
+                        if not os.path.commonpath([path, real_dest]) == real_dest:
+                            raise tarfile.LinkOutsideDestinationError(member, path)
+                    # Create symlink
+                    link_path = Path(placed)
+                    link_path.parent.mkdir(parents=True, exist_ok=True)
+                    if link_path.exists():
+                        link_path.unlink()
+                    link_path.symlink_to(member.linkname)
+                else:
+                    # Extract file member
+                    target = tf.extractfile(member)
+                    if target is None:
+                        # Directory or other special member
+                        continue
+                    member_path = Path(real_dest) / member.name
+                    member_path.parent.mkdir(parents=True, exist_ok=True)
+                    with member_path.open("wb") as f:
+                        shutil.copyfileobj(target, f)
+                    if member.mode is not None:
+                        os.chmod(member_path, member.mode)
 
 
 def extract(archive: Path, dest: Path) -> None:
